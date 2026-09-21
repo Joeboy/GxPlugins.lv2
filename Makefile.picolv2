@@ -1,0 +1,80 @@
+CXX := arm-none-eabi-g++
+NM := arm-none-eabi-nm
+STRIP ?= 1
+
+PICO_STRIP := $(if $(filter 0,$(STRIP)),true,arm-none-eabi-strip)
+MCPU := -mcpu=cortex-m33 -mthumb -mfloat-abi=hard -mfpu=fpv5-sp-d16
+CXXFLAGS := $(MCPU) -O2 -fomit-frame-pointer -ffast-math \
+	-fno-finite-math-only -fPIC -fno-builtin \
+	-fdata-sections -ffunction-sections -fvisibility=hidden \
+	-fvisibility-inlines-hidden -fno-exceptions -fno-rtti \
+	-fno-use-cxa-atexit -fno-threadsafe-statics -Wall -Wextra \
+	-std=gnu++11 -DPIC -DPICOLV2 -idirafter /usr/include
+LDFLAGS := $(MCPU) -shared -nostdlib -Wl,-Bsymbolic -Wl,-z,undefs \
+	-Wl,-z,max-page-size=0x1000 -Wl,--no-warnings -Wl,--gc-sections
+LDLIBS := -Wl,--start-group -lgcc -lc -lm -lnosys -Wl,--end-group
+
+PLUGINS ?= $(sort $(patsubst %/,%,$(wildcard Gx*.lv2/)))
+BUILD_DIR ?= build/picolv2
+LV2DIR ?= $(CURDIR)/build/picolv2-bundle
+ZITA_RESAMPLER_ROOT ?= ../zita-resampler
+ZITA_RESAMPLER_SOURCE := $(ZITA_RESAMPLER_ROOT)/source
+
+plugin_source = $(firstword $(wildcard $(1)/plugin/*.cpp))
+plugin_stem = $(basename $(notdir $(call plugin_source,$(1))))
+plugin_output = $(BUILD_DIR)/$(1)/$(call plugin_stem,$(1)).so
+bundle_output = $(LV2DIR)/$(call plugin_stem,$(1)).lv2/$(call plugin_stem,$(1)).so
+plugin_dsp_includes = $(foreach dir,$(wildcard $(1)/dsp/*/),-I$(dir))
+plugin_dsp_sources = $(shell find $(1)/dsp -type f \
+	\( -name '*.h' -o -name '*.cc' \) 2>/dev/null)
+
+PLUGIN_OUTPUTS := $(foreach plugin,$(PLUGINS),$(call plugin_output,$(plugin)))
+BUNDLE_OUTPUTS := $(foreach plugin,$(PLUGINS),$(call bundle_output,$(plugin)))
+
+.PHONY: all check-zita install check clean
+
+all: check-zita $(PLUGIN_OUTPUTS)
+
+check-zita:
+	@test -f "$(ZITA_RESAMPLER_SOURCE)/resampler.cc" || { \
+		echo "Missing zita-resampler source at $(ZITA_RESAMPLER_ROOT)" >&2; \
+		exit 1; \
+	}
+
+define BUILD_PLUGIN
+$(call plugin_output,$(1)): $(call plugin_source,$(1)) \
+		$$(wildcard $(1)/plugin/*.h) $(call plugin_dsp_sources,$(1)) \
+		$$(wildcard $$(ZITA_RESAMPLER_SOURCE)/*.cc \
+			$$(ZITA_RESAMPLER_SOURCE)/zita-resampler/*.h) picolv2-runtime.cpp
+	mkdir -p $$(@D)
+	$$(CXX) $$(CXXFLAGS) -I$$(ZITA_RESAMPLER_SOURCE) \
+		-I$(1) -I$(1)/dsp -I$(1)/plugin \
+		$(call plugin_dsp_includes,$(1)) \
+		$(call plugin_source,$(1)) picolv2-runtime.cpp \
+		$$(LDFLAGS) $$(LDLIBS) -o $$@
+	$$(PICO_STRIP) -s $$@
+
+$(call bundle_output,$(1)): $(call plugin_output,$(1)) $$(wildcard $(1)/MOD/*)
+	mkdir -p $$(@D)
+	cp -R $(1)/MOD/. $$(@D)/
+	cp $$< $$@
+endef
+
+$(foreach plugin,$(PLUGINS),$(eval $(call BUILD_PLUGIN,$(plugin))))
+
+install: $(BUNDLE_OUTPUTS)
+
+check: all
+	@set -e; \
+	for plugin in $(PLUGIN_OUTPUTS); do \
+		bad=`$(NM) -u "$$plugin" | awk '{print $$2}' | \
+			grep -Ev '^(picolv2_alloc|picolv2_dealloc|picolv2_log_write)$$' || true`; \
+		if test -n "$$bad"; then \
+			echo "Unexpected undefined symbols in $$plugin:" >&2; \
+			echo "$$bad" >&2; \
+			exit 1; \
+		fi; \
+	done
+
+clean:
+	rm -rf "$(BUILD_DIR)"
